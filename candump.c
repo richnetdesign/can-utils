@@ -63,6 +63,8 @@
 #include <linux/can.h>
 #include <linux/can/raw.h>
 
+//#include <unistd.h>
+
 #include "terminal.h"
 #include "lib.h"
 
@@ -110,9 +112,23 @@ const int canfd_on = 1;
 const char anichar[MAXANI] = {'|', '/', '-', '\\'};
 const char extra_m_info[4][4] = {"- -", "B -", "- E", "B E"};
 
+#define MAX_FILENAME_LENGTH 100
+
+FILE *logfile = NULL;
+static char log_filename[MAX_FILENAME_LENGTH];
+
+unsigned char silent = SILENT_INI;
+
 extern int optind, opterr, optopt;
 
 static volatile int running = 1;
+static volatile int flag_reopen_file = 0;
+
+static volatile unsigned long rotation_count = 0;
+
+int isAutoFileName = 0;
+
+int openLogFile(const char * filename);
 
 void print_usage(char *prg)
 {
@@ -127,7 +143,7 @@ void print_usage(char *prg)
 	fprintf(stderr, "         -a          (enable additional ASCII output)\n");
 	fprintf(stderr, "         -S          (swap byte order in printed CAN data[] - marked with '%c' )\n", SWAP_DELIMITER);
 	fprintf(stderr, "         -s <level>  (silent mode - %d: off (default) %d: animation %d: silent)\n", SILENT_OFF, SILENT_ANI, SILENT_ON);
-	fprintf(stderr, "         -l          (log CAN-frames into file. Sets '-s %d' by default)\n", SILENT_ON);
+	fprintf(stderr, "         -l <filename>        (log CAN-frames into file. Sets '-s %d' by default)\n", SILENT_ON);
 	fprintf(stderr, "         -L          (use log file format on stdout)\n");
 	fprintf(stderr, "         -n <count>  (terminate after reception of <count> CAN frames)\n");
 	fprintf(stderr, "         -r <size>   (set socket receive buffer to <size>)\n");
@@ -161,7 +177,29 @@ void print_usage(char *prg)
 
 void sigterm(int signo)
 {
+	if(signo == SIGHUP)
+	{
+		flag_reopen_file = 1;
+
+		rotation_count++;
+		return;
+	}
+
 	running = 0;
+}
+
+
+void logrotatehandler(int signo)
+{
+	if(signo != SIGHUP)
+	{
+		return;
+	}
+
+	flag_reopen_file = 1;
+
+	rotation_count++;
+	
 }
 
 int idx2dindex(int ifidx, int socket) {
@@ -213,6 +251,86 @@ int idx2dindex(int ifidx, int socket) {
 	return i;
 }
 
+
+int openLogFile(const char * fileName)
+{
+	if (silent != SILENT_ON)
+		fprintf(stderr, "Warning: Console output active while logging!\n");
+
+	if(fileName[0] == 0)
+	{
+		//todo overwrite check
+		logfile = fopen(fileName, "w");
+	}
+	else
+	{
+		if(rotation_count > 0)
+		{
+			logfile = fopen(fileName, "a");
+		}
+		else
+		{
+			logfile = fopen(fileName, "w");
+		}
+		
+
+	}
+	
+
+	if (!logfile) {
+		perror("logfile");
+		return 1;
+	}
+
+	return 0;
+}
+
+int reopen_file(void)
+{
+	//writing to log file
+	fflush(logfile);
+	fclose(logfile);
+
+	if(isAutoFileName == 1)
+	{
+		time_t currtime;
+		struct tm now;
+
+		if (time(&currtime) == (time_t)-1) {
+			perror("time");
+			//running = 0;
+			return 1;
+		}
+
+		localtime_r(&currtime, &now);
+
+		sprintf(log_filename, "candump-%04d-%02d-%02d_%02d%02d%02d.log",
+			now.tm_year + 1900,
+			now.tm_mon + 1,
+			now.tm_mday,
+			now.tm_hour,
+			now.tm_min,
+			now.tm_sec);
+
+		fprintf(stderr, "Enabling Logfile '%s'\n", log_filename);
+
+	}
+
+	int code = openLogFile(log_filename);
+
+	if(code != 0)
+	{
+		running = 0;
+	}
+	else
+	{
+	}
+
+	flag_reopen_file = 0;
+
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	fd_set rdfs;
@@ -222,7 +340,7 @@ int main(int argc, char **argv)
 	unsigned char down_causes_exit = 1;
 	unsigned char dropmonitor = 0;
 	unsigned char extra_msg_info = 0;
-	unsigned char silent = SILENT_INI;
+	
 	unsigned char silentani = 0;
 	unsigned char color = 0;
 	unsigned char view = 0;
@@ -246,16 +364,41 @@ int main(int argc, char **argv)
 	struct ifreq ifr;
 	struct timeval tv, last_tv;
 	struct timeval timeout, timeout_config = { 0, 0 }, *timeout_current = NULL;
-	FILE *logfile = NULL;
+	
 
 	signal(SIGTERM, sigterm);
-	signal(SIGHUP, sigterm);
+	
 	signal(SIGINT, sigterm);
+	
+	if (log)
+	{
+		struct sigaction usr_action;
+		sigset_t block_mask;
+
+		sigfillset (&block_mask);
+
+		usr_action.sa_handler = logrotatehandler;
+		usr_action.sa_mask = block_mask;
+		usr_action.sa_flags = 0;
+		
+		// Restart the system call, if at all possible
+    	usr_action.sa_flags = SA_RESTART;
+
+		if( sigaction (SIGHUP, &usr_action, NULL) == -1) {
+		}
+	}
+	else
+	{
+		signal(SIGHUP, sigterm);
+	}
+	
 
 	last_tv.tv_sec  = 0;
 	last_tv.tv_usec = 0;
 
-	while ((opt = getopt(argc, argv, "t:HciaSs:lDdxLn:r:heT:?")) != -1) {
+	memset(&log_filename,0,sizeof(log_filename));
+
+	while ((opt = getopt(argc-1, argv, ":t:HciaSs:l:DdxLn:r:heT:?")) != -1) {
 		switch (opt) {
 		case 't':
 			timestamp = optarg[0];
@@ -299,8 +442,75 @@ int main(int argc, char **argv)
 			}
 			break;
 
+		case ':':
+			
+
+			switch (optopt)
+			{
+			case 'l':
+			{
+				log = 1;
+
+				if(optarg != 0)
+				{
+					size_t len = strnlen(optarg,MAX_FILENAME_LENGTH);
+					if(len > 0 && len < MAX_FILENAME_LENGTH)
+					{
+						strncpy(log_filename,optarg,MAX_FILENAME_LENGTH);
+					}
+					isAutoFileName = 0;
+				}
+				else
+				{
+					isAutoFileName = 1;
+						
+					time_t currtime;
+					struct tm now;
+					//char fname[83]; /* suggested by -Wformat-overflow= */
+
+					if (time(&currtime) == (time_t)-1) {
+						perror("time");
+						//running = 0;
+						return 1;
+					}
+
+					localtime_r(&currtime, &now);
+
+					sprintf(log_filename, "candump-%04d-%02d-%02d_%02d%02d%02d.log",
+						now.tm_year + 1900,
+						now.tm_mon + 1,
+						now.tm_mday,
+						now.tm_hour,
+						now.tm_min,
+						now.tm_sec);
+
+					fprintf(stderr, "Enabling Logfile '%s'\n", log_filename);
+				}
+				
+
+				break;
+			}
+			default:
+				fprintf(stderr, "option -%c is missing a required argument\n", optopt);
+				return EXIT_FAILURE;
+			}		
+			
+
+			break;
+
 		case 'l':
 			log = 1;
+			
+			if(optarg != 0)
+			{
+				size_t len = strnlen(optarg,100);
+				if(len > 0 && len < 100)
+				{
+					strncpy(log_filename,optarg,100);
+					printf(log_filename);
+				}
+			}
+
 			break;
 
 		case 'D':
@@ -570,33 +780,10 @@ int main(int argc, char **argv)
 	}
 
 	if (log) {
-		time_t currtime;
-		struct tm now;
-		char fname[83]; /* suggested by -Wformat-overflow= */
+		int result = openLogFile(log_filename);
 
-		if (time(&currtime) == (time_t)-1) {
-			perror("time");
-			return 1;
-		}
-
-		localtime_r(&currtime, &now);
-
-		sprintf(fname, "candump-%04d-%02d-%02d_%02d%02d%02d.log",
-			now.tm_year + 1900,
-			now.tm_mon + 1,
-			now.tm_mday,
-			now.tm_hour,
-			now.tm_min,
-			now.tm_sec);
-
-		if (silent != SILENT_ON)
-			fprintf(stderr, "Warning: Console output active while logging!\n");
-
-		fprintf(stderr, "Enabling Logfile '%s'\n", fname);
-
-		logfile = fopen(fname, "w");
-		if (!logfile) {
-			perror("logfile");
+		if(result != 0)
+		{
 			return 1;
 		}
 	}
@@ -619,7 +806,24 @@ int main(int argc, char **argv)
 
 		if ((ret = select(s[currmax-1]+1, &rdfs, NULL, NULL, timeout_current)) <= 0) {
 			//perror("select");
-			running = 0;
+
+			error_t serr = errno;
+
+			if(serr == EINTR)
+			{
+				if(flag_reopen_file == 1)
+				{
+					if(reopen_file() != 0)
+					{
+						return 1;
+					}
+				}
+			}
+			else
+			{
+				running = 0;
+			}
+			
 			continue;
 		}
 
@@ -804,6 +1008,14 @@ int main(int argc, char **argv)
 
 		out_fflush:
 			fflush(stdout);
+		}
+
+		if(flag_reopen_file == 1)
+		{
+			if(reopen_file() != 0)
+			{
+				return -1;
+			}
 		}
 	}
 
