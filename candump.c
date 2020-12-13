@@ -113,6 +113,8 @@ static int dindex[MAXIFNAMES];
 static int max_devname_len; /* to prevent frazzled device name output */
 static const int canfd_on = 1;
 
+static char fname[83] = { 0 }; /* suggested by -Wformat-overflow= */
+
 #define MAXANI 4
 static const char anichar[MAXANI] = { '|', '/', '-', '\\' };
 static const char extra_m_info[4][4] = { "- -", "B -", "- E", "B E" };
@@ -135,6 +137,7 @@ static void print_usage(char *prg)
 	fprintf(stderr, "         -S          (swap byte order in printed CAN data[] - marked with '%c' )\n", SWAP_DELIMITER);
 	fprintf(stderr, "         -s <level>  (silent mode - %d: off (default) %d: animation %d: silent)\n", SILENT_OFF, SILENT_ANI, SILENT_ON);
 	fprintf(stderr, "         -l          (log CAN-frames into file. Sets '-s %d' by default)\n", SILENT_ON);
+	fprintf(stderr, "         -m <size>   (log file max size - size examples: 1024, 1k, 100m, 1g)\n");
 	fprintf(stderr, "         -L          (use log file format on stdout)\n");
 	fprintf(stderr, "         -n <count>  (terminate after reception of <count> CAN frames)\n");
 	fprintf(stderr, "         -r <size>   (set socket receive buffer to <size>)\n");
@@ -267,6 +270,56 @@ static inline void sprint_timestamp(const char timestamp, const struct timeval *
 	}
 }
 
+int openlogfile(FILE **logfile) {
+	time_t currtime;
+	struct tm now;
+
+	if (time(&currtime) == (time_t)-1) {
+		perror("time");
+		return 1;
+	}
+
+	localtime_r(&currtime, &now);
+
+	if (fname[0] == 0) {
+		sprintf(fname, "candump-%04d-%02d-%02d_%02d%02d%02d.log", now.tm_year + 1900,
+			now.tm_mon + 1, now.tm_mday, now.tm_hour, now.tm_min, now.tm_sec);
+
+		fprintf(stderr, "Enabling Logfile '%s'\n", fname);
+	}
+
+	FILE *tmpfile = fopen(fname, "w");
+	if (!tmpfile) {
+		perror("logfile");
+		return 1;
+	}
+	*logfile = tmpfile;
+
+	return 0;
+}
+
+unsigned long convertsize(const char *str) {
+	char *tmp;
+	unsigned long ret = strtoul(str, &tmp, 10);
+
+	if (strlen(tmp) == 0)
+		return ret;
+
+	if (strlen(tmp) == 1)
+	{
+		if (tmp[0] == 'k')
+			return ret * 1024;
+
+		if (tmp[0] == 'm')
+			return ret * 1024 * 1024;
+
+		if (tmp[0] == 'g')
+			return ret * 1024 * 1024 * 1024;
+	}
+	
+	return 0;
+}
+
 static inline void print_timestamp(const char timestamp, const struct timeval *tv,
 				   struct timeval *const last_tv)
 {
@@ -295,6 +348,8 @@ int main(int argc, char **argv)
 	unsigned char view = 0;
 	unsigned char log = 0;
 	unsigned char logfrmt = 0;
+	unsigned long logmax = 0;
+	unsigned char part = 0;
 	int count = 0;
 	int rcvbuf_size = 0;
 	int opt, num_events;
@@ -322,7 +377,7 @@ int main(int argc, char **argv)
 	last_tv.tv_sec = 0;
 	last_tv.tv_usec = 0;
 
-	while ((opt = getopt(argc, argv, "t:HciaSs:lDdxLn:r:he8T:?")) != -1) {
+	while ((opt = getopt(argc, argv, "t:HciaSs:lDdxLmn:r:he8T:?")) != -1) {
 		switch (opt) {
 		case 't':
 			timestamp = optarg[0];
@@ -376,6 +431,10 @@ int main(int argc, char **argv)
 
 		case 'l':
 			log = 1;
+			break;
+
+		case 'm':
+			logmax = convertsize(optarg);
 			break;
 
 		case 'D':
@@ -651,35 +710,11 @@ int main(int argc, char **argv)
 	}
 
 	if (log) {
-		time_t currtime;
-		struct tm now;
-		char fname[83]; /* suggested by -Wformat-overflow= */
-
-		if (time(&currtime) == (time_t)-1) {
-			perror("time");
+		if (openlogfile(&logfile) != 0)
 			return 1;
-		}
-
-		localtime_r(&currtime, &now);
-
-		sprintf(fname, "candump-%04d-%02d-%02d_%02d%02d%02d.log",
-			now.tm_year + 1900,
-			now.tm_mon + 1,
-			now.tm_mday,
-			now.tm_hour,
-			now.tm_min,
-			now.tm_sec);
 
 		if (silent != SILENT_ON)
 			fprintf(stderr, "Warning: Console output active while logging!\n");
-
-		fprintf(stderr, "Enabling Logfile '%s'\n", fname);
-
-		logfile = fopen(fname, "w");
-		if (!logfile) {
-			perror("logfile");
-			return 1;
-		}
 	}
 
 	/* these settings are static and can be held out of the hot path */
@@ -773,6 +808,30 @@ int main(int argc, char **argv)
 			/* once we detected a EFF frame indent SFF frames accordingly */
 			if (frame.can_id & CAN_EFF_FLAG)
 				view |= CANLIB_VIEW_INDENT_SFF;
+			
+			if (log) {
+				char buf[CL_CFSZ]; /* max length */
+				char line[CL_CFSZ + max_devname_len + 22];
+
+				/* log CAN frame with absolute timestamp & device */
+				sprint_canframe(buf, &frame, 0, maxdlen);
+				int n = sprintf(line, "(%010ld.%06ld) %*s %s\n",
+					tv.tv_sec, tv.tv_usec,
+					max_devname_len, devname[idx], buf);
+				if (logmax && ftell(logfile) + n > logmax) {
+					fclose(logfile);
+					char postfix[7] = { 0 };
+					char fullfname[sizeof(fname) + sizeof(postfix)];
+					sprintf(postfix, ".pt%u", part);
+					strcpy(fullfname, fname);
+					strcat(fullfname, postfix);
+					rename(fname, fullfname);
+					++part;
+					if (openlogfile(&logfile) != 0)
+						return 1;
+				}
+				fprintf(logfile, "%s", line);
+			}
 
 			if (extra_msg_info) {
 				if (msg.msg_flags & MSG_DONTROUTE)
